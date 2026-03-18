@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+from torch.nn import Parameter
 
 
 class NLBR(torch.nn.Module):
@@ -44,12 +45,14 @@ class NLBR(torch.nn.Module):
         self.register_buffer("_evecs", None)
         self.register_buffer("_evals_Vinv", None)
         self.register_buffer("_evals_bProj", None)
+        self.register_buffer("_evals_VinvbProj", None)
         self.register_buffer("_evecs_Vinv", None)
         self.register_buffer("_evecs_bProj", None)
+        self.register_buffer("_evecs_VinvbProj", None)
         self.register_buffer("_Kx_mean", None)
-        self.N = None
-        self.intercept_variance_ratio = None
-        self.regression_variance_ratio = None
+        self.N: int | None = None
+        self.intercept_variance_ratio: float | Parameter | None = None
+        self.regression_variance_ratio: float | Parameter | None = None
         # initialize
         if variance_explained < 0. or variance_explained > 1.:
             raise ValueError("variance_explained must be in [0, 1]")
@@ -100,8 +103,8 @@ class NLBR(torch.nn.Module):
 
     def update_variance_ratios(
             self,
-            intercept_variance_ratio: float | None = None,
-            regression_variance_ratio: float | None = None
+            intercept_variance_ratio: float | Parameter | None = None,
+            regression_variance_ratio: float | Parameter | None = None
     ) -> None:
         """Update intercept/regression variance ratios and derived buffers.
 
@@ -128,9 +131,11 @@ class NLBR(torch.nn.Module):
             else:
                 self._evals_Vinv = 1. / (self.N * evals)
                 self._evals_bProj = torch.zeros_like(evals)
+            self._evals_VinvbProj = self._evals_Vinv*self._evals_bProj
             # Precompute scaled eigenvectors once here to avoid per-call products in ese()
             self._evecs_Vinv = self._evecs * self._evals_Vinv   # N x D
             self._evecs_bProj = self._evecs * self._evals_bProj  # N x D
+            self._evecs_VinvbProj = self._evecs * self._evals_VinvbProj  # N x D
 
     def ppm(
             self,
@@ -142,8 +147,8 @@ class NLBR(torch.nn.Module):
 
         Args:
             Kx_test_train: Cross-kernel between test and train, shape `(M, N)`.
-            u_train: Row-aligned train-side targets/features, shape `(M, N)`.
-            u_prior: Optional prior with shape `(M, N)`.
+            u_train: Row-aligned train-side responses, shape `(M, N)`.
+            u_prior: Optional prior mean with shape `(M, N)`.
 
         Returns:
             Tensor with shape `(M,)`.
@@ -180,6 +185,65 @@ class NLBR(torch.nn.Module):
         proj_diff = diff @ self._evecs              # M x D
         ip = (proj_kx * proj_diff).sum(dim=1)       # M
         return intercept + ip
+
+    def ppm_weights(self, Kx_test_train: Tensor) -> tuple[Tensor, Tensor]:
+        """Return weights mapping `u_train` and `u_prior` to `ppm`.
+
+        Args:
+            Kx_test_train: Cross-kernel between test and train, shape `(M, N)`.
+
+        Returns:
+            Weight matrices `W_train` and `W_prior` with shape `(M, N)` such that
+            `ppm(Kx_test_train, u_train, u_prior) == (W_train * u_train + W_prior * u_prior).sum(dim=1)`.
+        """
+        device = self._device()
+        Kx_test_train = Kx_test_train.to(device)
+
+        if Kx_test_train.ndim != 2 or Kx_test_train.size(1) != self.N:
+            raise ValueError("Kx_test_train must have shape (M, N) with N equal to training size.")
+
+        # Mirror ppm() centering of test-train features.
+        Kx_test_train = Kx_test_train - self._Kx_mean.unsqueeze(0)
+        Kx_test_train = Kx_test_train - Kx_test_train.mean(dim=1, keepdim=True)
+
+        # Regression terms from centred features to centred responses.
+        proj_kx = Kx_test_train @ self._evecs_Vinv              # M x D
+        W_train_centered = proj_kx @ self._evecs.T              # M x N
+        proj_kx_prior = Kx_test_train @ self._evecs_VinvbProj   # M x D
+        W_prior_centered = proj_kx_prior @ self._evecs.T        # M x N
+
+        # Fold centering and intercept into raw-u weights so they can be applied directly.
+        r2 = self.intercept_variance_ratio
+        if r2 < float("inf"):
+            train_mean_coeff = (self.N * r2) / (1 + self.N * r2)
+            prior_mean_coeff = 1 / (1 + self.N * r2)
+        else:
+            train_mean_coeff = 1.0
+            prior_mean_coeff = 0.0
+
+        train_mean_coeff = torch.as_tensor(train_mean_coeff, dtype=Kx_test_train.dtype, device=device)
+        prior_mean_coeff = torch.as_tensor(prior_mean_coeff, dtype=Kx_test_train.dtype, device=device)
+
+        W_train = W_train_centered + (train_mean_coeff - W_train_centered.sum(dim=1, keepdim=True)) / self.N
+        W_prior = W_prior_centered + (prior_mean_coeff - W_prior_centered.sum(dim=1, keepdim=True)) / self.N
+
+        return W_train, W_prior
+
+    def ppm_through_weights(
+            self,
+            Kx_test_train: Tensor,          # M x N
+            u_train: Tensor,                # M x N
+            u_prior: Tensor | None = None,  # M x N (optional prior)
+    ) -> Tensor:
+        W_train, W_prior = self.ppm_weights(Kx_test_train)
+        u_train = u_train.to(W_train.device)
+        ppm_train = (W_train * u_train).sum(dim=1)
+        if u_prior is None:
+            u_prior = torch.zeros_like(u_train)
+        else:
+            u_prior = u_prior.to(W_train.device)
+        ppm_prior = (W_prior * u_prior).sum(dim=1)
+        return ppm_train + ppm_prior
 
     def __repr__(self) -> str:
         n_components = len(self._evals) if self._evals is not None else None
