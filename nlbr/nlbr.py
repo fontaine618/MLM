@@ -1,0 +1,191 @@
+import torch
+from torch import Tensor
+
+
+class NLBR(torch.nn.Module):
+    """Nonlinear Bayesian regression.
+
+    U = a + b(x) + e
+    a ~ Gaussian
+    b ~ Gaussian
+
+    a has mean induced by u_prior and variance proportional to the error variance
+    b has mean induced by u_prior and covariance operator proportional to a power of
+    the empirical covariance operator of the features
+
+    The main purpose of this class is to compute the posterior predictive mean E[U|X=x,D].
+
+    """
+
+    def __init__(
+            self,
+            Kx_train_train: Tensor,
+            intercept_variance_ratio: float = 0.,
+            regression_variance_ratio: float = 1e-6,
+            variance_explained: float = 0.99,
+            power: float = 0.
+    ):
+        """Initialize NLBR and precompute its spectral state.
+
+        Args:
+            Kx_train_train: Training kernel matrix with shape `(N, N)`.
+            intercept_variance_ratio: Ratio controlling intercept shrinkage.
+            regression_variance_ratio: Ratio controlling regression strength.
+            variance_explained: Fraction of cumulative variance to retain in
+                the eigenspectrum (in `[0, 1]`).
+            power: Exponent used in the spectral prior scaling.
+
+        Raises:
+            ValueError: If `variance_explained` is outside `[0, 1]`.
+        """
+        super().__init__()
+        # Register tensors as buffers so module.to(device) migrates all cached state.
+        self.register_buffer("_evals", None)
+        self.register_buffer("_evecs", None)
+        self.register_buffer("_evals_Vinv", None)
+        self.register_buffer("_evals_bProj", None)
+        self.register_buffer("_evecs_Vinv", None)
+        self.register_buffer("_evecs_bProj", None)
+        self.register_buffer("_Kx_mean", None)
+        self.N = None
+        self.intercept_variance_ratio = None
+        self.regression_variance_ratio = None
+        # initialize
+        if variance_explained < 0. or variance_explained > 1.:
+            raise ValueError("variance_explained must be in [0, 1]")
+        self.power = power
+        self.variance_explained = variance_explained
+        self.update_kernel_matrix(Kx_train_train)
+        self.update_variance_ratios(intercept_variance_ratio, regression_variance_ratio)
+
+    def _device(self) -> torch.device:
+        """Return the active device for NLBR cached buffers."""
+        if self._evecs is not None:
+            return self._evecs.device
+        if self._Kx_mean is not None:
+            return self._Kx_mean.device
+        raise RuntimeError("NLBR buffers are not initialized")
+
+    def update_kernel_matrix(self, Kx_train_train: Tensor) -> None:
+        """Recompute the low-rank kernel representation from training data.
+
+        Args:
+            Kx_train_train: Training kernel matrix with shape `(N, N)`.
+
+        Side effects:
+            Updates `N` and cached buffers used by `ese`.
+        """
+        N = self.N = Kx_train_train.size(0)
+        # Column means — reused for out-of-sample centering in ese()
+        Kx_mean = Kx_train_train.mean(dim=0)
+        # Double-centre the Gram matrix in O(N^2) instead of the O(N^3) H @ K @ H einsum
+        row_mean = Kx_train_train.mean(dim=1, keepdim=True)
+        grand_mean = row_mean.mean()
+        G = Kx_train_train - row_mean - Kx_mean.unsqueeze(0) + grand_mean
+        # Compute covariance operator
+        S = G / N
+        # Compute eigendecomposition of covariance operator
+        # eigh returns eigenvalues in ascending order; flip to descending in O(D)
+        evals, evecs = torch.linalg.eigh(S)
+        evals = torch.flip(evals, dims=[0]).clamp(min=0.)
+        evecs = torch.flip(evecs, dims=[1]).contiguous()
+        # Keep only up to variance explained (also roots out the zero eigenvalues)
+        cumvar = torch.cumsum(evals, dim=0)
+        totalvar = cumvar[-1]
+        target = self.variance_explained * totalvar
+        n_components = min(int(torch.searchsorted(cumvar, target).item()) + 1, N)
+        self._evals = evals[:n_components].contiguous()
+        self._evecs = evecs[:, :n_components].contiguous()
+        self._Kx_mean = Kx_mean
+
+    def update_variance_ratios(
+            self,
+            intercept_variance_ratio: float | None = None,
+            regression_variance_ratio: float | None = None
+    ) -> None:
+        """Update intercept/regression variance ratios and derived buffers.
+
+        Args:
+            intercept_variance_ratio: Optional new intercept ratio.
+            regression_variance_ratio: Optional new regression ratio.
+
+        Raises:
+            ValueError: If provided ratios are outside valid ranges.
+        """
+        if intercept_variance_ratio is not None:
+            if intercept_variance_ratio < 0.:
+                raise ValueError("intercept_variance_ratio must be nonnegative")
+            self.intercept_variance_ratio = intercept_variance_ratio
+        if regression_variance_ratio is not None:
+            if regression_variance_ratio < 1e-10:
+                raise ValueError("regression_variance_ratio must be positive")
+            r2 = self.regression_variance_ratio = regression_variance_ratio
+            evals = self._evals
+            p = self.power
+            if r2 < float("inf"):
+                self._evals_Vinv = evals.pow(p) * r2 / (self.N * evals.pow(p + 1.) * r2 + 1.)
+                self._evals_bProj = evals.pow(-1. - p) / (r2 * self.N)
+            else:
+                self._evals_Vinv = 1. / (self.N * evals)
+                self._evals_bProj = torch.zeros_like(evals)
+            # Precompute scaled eigenvectors once here to avoid per-call products in ese()
+            self._evecs_Vinv = self._evecs * self._evals_Vinv   # N x D
+            self._evecs_bProj = self._evecs * self._evals_bProj  # N x D
+
+    def ppm(
+            self,
+            Kx_test_train: Tensor,          # M x N
+            u_train: Tensor,                # M x N
+            u_prior: Tensor | None = None,  # M x N (optional prior)
+    ) -> Tensor:
+        """Posterior predictive mean.
+
+        Args:
+            Kx_test_train: Cross-kernel between test and train, shape `(M, N)`.
+            u_train: Row-aligned train-side targets/features, shape `(M, N)`.
+            u_prior: Optional prior with shape `(M, N)`.
+
+        Returns:
+            Tensor with shape `(M,)`.
+
+        Notes:
+            Inputs are moved to the module device before computation.
+        """
+        device = self._device()
+        Kx_test_train = Kx_test_train.to(device)
+        u_train = u_train.to(device)
+        if u_prior is not None:
+            u_prior = u_prior.to(device)
+
+        # Compute centred feature matrix
+        Kx_test_train = Kx_test_train - self._Kx_mean.unsqueeze(0)
+        Kx_test_train = Kx_test_train - Kx_test_train.mean(dim=1, keepdim=True)
+        # Centre u_train
+        ubar = u_train.mean(dim=1)
+        u_train = u_train - ubar.unsqueeze(-1)
+        # Coordinate representation of the prior
+        if u_prior is None:
+            u_prior = torch.zeros_like(u_train)
+        a = u_prior.mean(dim=1)
+        u_prior = u_prior - a.unsqueeze(-1)
+        b = (u_prior @ self._evecs) @ self._evecs_bProj.T  # M x N
+        diff = u_train + b
+        # Compute intercept
+        r2 = self.intercept_variance_ratio
+        if r2 < float("inf"):
+            intercept = (a + self.N * r2 * ubar) / (1 + self.N * r2)
+        else:
+            intercept = ubar
+        proj_kx = Kx_test_train @ self._evecs_Vinv  # M x D
+        proj_diff = diff @ self._evecs              # M x D
+        ip = (proj_kx * proj_diff).sum(dim=1)       # M
+        return intercept + ip
+
+    def __repr__(self) -> str:
+        n_components = len(self._evals) if self._evals is not None else None
+        return (
+            f"NLBR(N={self.N}, D={n_components}, power={self.power}, "
+            f"variance_explained={self.variance_explained}, "
+            f"intercept_variance_ratio={self.intercept_variance_ratio}, "
+            f"regression_variance_ratio={self.regression_variance_ratio})"
+        )
