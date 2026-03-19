@@ -1,4 +1,3 @@
-from nlbr.nlbr import NLBR
+from nlbr.nlbr import NLR, NLBR
 
-__all__ = ["NLBR"]
-
+__all__ = ["NLR", "NLBR"]

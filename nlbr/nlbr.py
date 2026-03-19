@@ -3,6 +3,163 @@ from torch import Tensor
 from torch.nn import Parameter
 
 
+class NLR(torch.nn.Module):
+    """Nonlinear Regression (non-Bayesian).
+
+    Fits  U = a + b(x) + e  in kernel PCA feature space using ordinary
+    least squares:
+
+        a  = mean of the training responses  (per-row intercept)
+        b  = KPCA regression with no prior and no regularisation beyond
+             spectral truncation at ``variance_explained``
+
+    This is the non-Bayesian counterpart of NLBR: there are no priors,
+    no variance ratios, and no ``power`` parameter.
+    """
+
+    def __init__(
+            self,
+            Kx_train_train: Tensor,
+            variance_explained: float = 0.99,
+    ):
+        """Initialise NLR and precompute its spectral state.
+
+        Args:
+            Kx_train_train: Training kernel matrix with shape ``(N, N)``.
+            variance_explained: Fraction of cumulative variance to retain in
+                the eigenspectrum (in ``[0, 1]``).
+
+        Raises:
+            ValueError: If ``variance_explained`` is outside ``[0, 1]``.
+        """
+        super().__init__()
+        self.register_buffer("_evals", None)
+        self.register_buffer("_evecs", None)
+        self.register_buffer("_evecs_Vinv", None)
+        self.register_buffer("_Kx_mean", None)
+        self.N: int | None = None
+        if variance_explained < 0. or variance_explained > 1.:
+            raise ValueError("variance_explained must be in [0, 1]")
+        self.variance_explained = variance_explained
+        self.update_kernel_matrix(Kx_train_train)
+
+    def _device(self) -> torch.device:
+        """Return the active device for NLR cached buffers."""
+        if self._evecs is not None:
+            return self._evecs.device
+        if self._Kx_mean is not None:
+            return self._Kx_mean.device
+        raise RuntimeError("NLR buffers are not initialized")
+
+    def update_kernel_matrix(self, Kx_train_train: Tensor) -> None:
+        """Recompute the low-rank kernel representation from training data.
+
+        Args:
+            Kx_train_train: Training kernel matrix with shape ``(N, N)``.
+        """
+        N = self.N = Kx_train_train.size(0)
+        # Column means — reused for out-of-sample centering
+        Kx_mean = Kx_train_train.mean(dim=0)
+        # Double-centre the Gram matrix
+        row_mean = Kx_train_train.mean(dim=1, keepdim=True)
+        grand_mean = row_mean.mean()
+        G = Kx_train_train - row_mean - Kx_mean.unsqueeze(0) + grand_mean
+        # Eigendecomposition of the empirical covariance operator
+        S = G / N
+        evals, evecs = torch.linalg.eigh(S)
+        evals = torch.flip(evals, dims=[0]).clamp(min=0.)
+        evecs = torch.flip(evecs, dims=[1]).contiguous()
+        # Truncate at variance_explained
+        cumvar = torch.cumsum(evals, dim=0)
+        target = self.variance_explained * cumvar[-1]
+        n_components = min(int(torch.searchsorted(cumvar, target).item()) + 1, N)
+        self._evals = evals[:n_components].contiguous()
+        self._evecs = evecs[:, :n_components].contiguous()
+        self._Kx_mean = Kx_mean
+        # OLS weight matrix in spectral space: V @ diag(1 / (N * lambda))
+        self._evecs_Vinv = self._evecs / (N * self._evals)   # N x D
+
+    def predict(
+            self,
+            Kx_test_train: Tensor,          # M x N
+            u_train: Tensor,                # M x N
+    ) -> Tensor:                            # M
+        """Predict responses at test points.
+
+        Args:
+            Kx_test_train: Cross-kernel between test and train, shape ``(M, N)``.
+            u_train: Row-aligned training responses, shape ``(M, N)``.
+
+        Returns:
+            Tensor of shape ``(M,)``.
+        """
+        device = self._device()
+        Kx_test_train = Kx_test_train.to(device)
+        u_train = u_train.to(device)
+        # Column-centre only — row-centering is a no-op because 1^T v = 0
+        Kx_test_train = Kx_test_train - self._Kx_mean.unsqueeze(0)
+        ubar = u_train.mean(dim=1)                           # M
+        proj_kx = Kx_test_train @ self._evecs_Vinv           # M x D
+        proj_u  = u_train @ self._evecs                      # M x D  (centering u is also a no-op)
+        return ubar + (proj_kx * proj_u).sum(dim=1)
+
+    def predict_weights(self, Kx_test_train: Tensor) -> Tensor:
+        """Return the weight vector mapping ``u_train`` to ``predict``.
+
+        Args:
+            Kx_test_train: Cross-kernel between test and train, shape ``(M, N)``.
+
+        Returns:
+            Weight matrix ``W`` of shape ``(M, N)`` such that
+            ``predict(K, u) == (W * u).sum(1)`` when ``u`` is ``(M, N)``, or
+            ``W @ u`` when ``u`` is ``(N, K)`` (see
+            ``pairwise_predict_through_weights``).
+        """
+        device = self._device()
+        Kx_test_train = Kx_test_train.to(device)
+        if Kx_test_train.ndim != 2 or Kx_test_train.size(1) != self.N:
+            raise ValueError("Kx_test_train must have shape (M, N)")
+        Kx_test_train = Kx_test_train - self._Kx_mean.unsqueeze(0)
+        proj_kx   = Kx_test_train @ self._evecs_Vinv         # M x D
+        W_centered = proj_kx @ self._evecs.T                  # M x N
+        # evecs^T @ 1 = 0  =>  W_centered @ 1 = 0;
+        # add 1/N uniformly to fold the intercept (mean) into the weights
+        return W_centered + (1.0 / self.N)
+
+    def predict_through_weights(
+            self,
+            Kx_test_train: Tensor,          # M x N
+            u_train: Tensor,                # M x N
+    ) -> Tensor:
+        """Convenience wrapper: ``predict`` via the weight matrix."""
+        W = self.predict_weights(Kx_test_train)
+        return (W * u_train.to(W.device)).sum(dim=1)
+
+    def pairwise_predict_through_weights(
+            self,
+            Kx_test_train: Tensor,          # M x N
+            u_train: Tensor,                # N x K
+    ) -> Tensor:
+        """Compute predictions for K target sets simultaneously.
+
+        Args:
+            Kx_test_train: Cross-kernel, shape ``(M, N)``.
+            u_train: Training responses for K targets, shape ``(N, K)``.
+
+        Returns:
+            Tensor of shape ``(M, K)``.
+        """
+        W = self.predict_weights(Kx_test_train)
+        return W @ u_train.to(W.device)
+
+    def __repr__(self) -> str:
+        n_components = len(self._evals) if self._evals is not None else None
+        return (
+            f"NLR(N={self.N}, D={n_components}, "
+            f"variance_explained={self.variance_explained})"
+        )
+
+
 class NLBR(torch.nn.Module):
     """Nonlinear Bayesian regression.
 
@@ -143,7 +300,7 @@ class NLBR(torch.nn.Module):
             u_train: Tensor,                # M x N
             u_prior: Tensor | None = None,  # M x N (optional prior)
     ) -> Tensor:
-        """Posterior predictive mean.
+        """Posterior predictive mean computed directly.
 
         Args:
             Kx_test_train: Cross-kernel between test and train, shape `(M, N)`.
@@ -193,8 +350,13 @@ class NLBR(torch.nn.Module):
             Kx_test_train: Cross-kernel between test and train, shape `(M, N)`.
 
         Returns:
-            Weight matrices `W_train` and `W_prior` with shape `(M, N)` such that
-            `ppm(Kx_test_train, u_train, u_prior) == (W_train * u_train + W_prior * u_prior).sum(dim=1)`.
+            Weight matrices `W_train` and `W_prior` with shape `(M, N)`.
+            These can be used to compute pairwise PPM given `K` target points:
+            `W_train @ u_train + W_prior @ u_prior`, a `(M, K)` tensor, where `u_train` and `u_prior`
+            are `(N, K)` tensors. They can also be used to compute the PPM efficiently at the `M` test points via
+            `(W_train * u_train).sum(1) + (W_prior * u_prior).sum(1)`,
+            where `u_train` and `u_prior` are `(M, N)` tensors.
+            See `ppm_through_weights` and `pairwise_ppm_through_weights` for examples.
         """
         device = self._device()
         Kx_test_train = Kx_test_train.to(device)
@@ -239,11 +401,27 @@ class NLBR(torch.nn.Module):
         u_train = u_train.to(W_train.device)
         ppm_train = (W_train * u_train).sum(dim=1)
         if u_prior is None:
-            u_prior = torch.zeros_like(u_train)
+            return ppm_train
         else:
             u_prior = u_prior.to(W_train.device)
-        ppm_prior = (W_prior * u_prior).sum(dim=1)
-        return ppm_train + ppm_prior
+            ppm_prior = (W_prior * u_prior).sum(dim=1)
+            return ppm_train + ppm_prior
+
+    def pairwise_ppm_through_weights(
+            self,
+            Kx_test_train: Tensor,          # M x N
+            u_train: Tensor,                # N x K
+            u_prior: Tensor | None = None,  # N x K
+    ) -> Tensor:
+        W_train, W_prior = self.ppm_weights(Kx_test_train)
+        u_train = u_train.to(W_train.device)
+        ppm_train = W_train @ u_train
+        if u_prior is None:
+            return ppm_train
+        else:
+            u_prior = u_prior.to(W_train.device)
+            ppm_prior = W_prior @ u_prior
+            return ppm_train + ppm_prior
 
     def __repr__(self) -> str:
         n_components = len(self._evals) if self._evals is not None else None
